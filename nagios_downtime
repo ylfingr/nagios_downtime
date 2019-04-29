@@ -59,23 +59,23 @@
 #                   - Code cleanups
 # 2013-07-31 v0.8   - Deleting of downtimes using multisite works now
 #                     (Needs Check_MK >= 1.2.3i2)
+# 2016-11-08 v0.9   - Enable setting downtimes for Wato Folder(s) and Service regexp
+#
 # ##############################################################################
 
 # ##############################################################################
 # Configuration (-> Here you have to set some values!)
 # ##############################################################################
-use strict;
-use warnings;
 
 # Interface/API to use to set downtimes. Can be set to "nagios" to use the
 # default CGI based webinterface or "multisite" to set downtimes via Check_MK
 # Multisite
-my $type = "nagios";
+my $type = 'multisite';
 
 # Protocol for the GET Request, In most cases "http", "https" is also possible
 my $webProto = "http";
 # IP or FQDN of Nagios server (example: nagios.domain.de)
-my $server = "localhost";
+my $server = "localhost
 # IP or FQDN of Nagios web server. In most cases same as $server, if
 # empty automaticaly using $server
 my $webServer = "";
@@ -84,7 +84,7 @@ my $webServer = "";
 my $webPort = 80;
 # Web path to Nagios cgi-bin (example: /nagios/cgi-bin) (NO trailing slash!)
 # Or if type is multisite, path to multisite (e.g. /check_mk)
-my $basePath = "/nagios/cgi-bin";
+my $basePath = "/cmk/check_mk";
 
 # When your interface is secured by basic authentication, you need to specify
 # the following three options. If you want to disable the basic authentication
@@ -106,7 +106,7 @@ my $authName = "Nagios Access";
 #
 
 # Nagios date format (same like set in value "date_format" in nagios.cfg)
-my $nagiosDateFormat = "us";
+my $nagiosDateFormat = "strict-iso8601";
 
 # When you have to use a proxy server for access to the nagios server, set the
 # URL here. The proxy will be set for this script for the choosen web protocol
@@ -124,13 +124,22 @@ my $downtimePath = '/tmp';
 
 # Some default options (Usualy no changes needed below this)
 
+use strict;
+use Time::HiRes qw(clock_gettime CLOCK_REALTIME);
+
+use constant {
+    HOST_DOWNTIME      => 1,
+    SERVICE_DOWNTIME   => 2,
+    FOLDER_DOWNTIME    => 3,
+    SVCREGEXP_DOWNTIME => 4,
+};
 # Script internal downtime id for a new downtime
 # Using the current timestamp as script internal downtime identifier
-my $downtimeId = time;
-# Default downtime type (1: Host Downtime, 2: Service Downtime)
-my $downtimeType = 1;
+my $downtimeId = clock_gettime(CLOCK_REALTIME);
+# Default downtime type (1: Host Downtime, 2: Service Downtime, 3: Folder(-based) Downtime)
+my $downtimeType = HOST_DOWNTIME;
 # Default Downtime duration in minutes
-my $downtimeDuration = 10;
+my $downtimeDuration = 0;
 # Default Downtime text
 my $downtimeComment = "Perl Downtime-Script";
 # Default Debugmode: off => 0 or on => 1
@@ -138,16 +147,27 @@ my $debug = 0;
 # Script version
 my $version = "0.8";
 
+# Timezone
+#my $timezone = 'Europe/Berlin';
+
+
+
 # ##############################################################################
 # Don't change anything below, except you know what you are doing.
 # ##############################################################################
 
+use strict;
+use warnings;
 use Net::Ping;
 use LWP 5.64;
 use Sys::Hostname;
 use Getopt::Long;
 use Switch;
+use DateTime;
+use URI::Encode;
 use JSON qw(decode_json);
+use Data::Dumper::Again;
+my $dd = Data::Dumper::Again->new(purity => 1, terse => 1, deepcopy => 1, quotekeys => 1, sortkeys => 1, deparse => 1);
 
 my $arg;
 my $p;
@@ -156,8 +176,15 @@ my $oBrowser;
 my $oResponse;
 my $hostname = "";
 my $service = "";
-my $start;
-my $end;
+my $folder = "";
+my $svcregexp = "";
+my $start = "";
+my $end = "";
+my $start_date;
+my $start_time;
+my $end_date;
+my $end_time;
+my $duration;
 my $url = "";
 my $help = "";
 my $now = time;
@@ -167,69 +194,74 @@ my $mode = "add";
 my %urls = (
     nagios => {
         host_downtime        => "[baseUrl]/cmd.cgi?cmd_typ=55&cmd_mod=2"
-							   ."&host=[hostname]&com_author=[user]&com_data=[comment]"
-							   ."&trigger=0&start_time=[start_time]&end_time=[end_time]"
-							   ."&fixed=1&childoptions=1&btnSubmit=Commit",
+    ."&host=[hostname]&com_author=[user]&com_data=[comment]"
+    ."&trigger=0&start_time=[start_time]&end_time=[end_time]"
+    ."&fixed=1&childoptions=1&btnSubmit=Commit",
         service_downtime     => "[baseUrl]/cmd.cgi?cmd_typ=56&cmd_mod=2"
-							   ."&host=[hostname]&service=[service]"
-							   ."&com_author=[user]&com_data=[comment]"
-							   ."&trigger=0&start_time=[start_time]&end_time=[end_time]"
-							   ."&fixed=1&btnSubmit=Commit",
-        del_host_downtime    => "[baseUrl]/cmd.cgi?cmd_typ=78&cmd_mod=2&down_id=[downtime_id]&btnSubmit=Commit",
-        del_service_downtime => "[baseUrl]/cmd.cgi?cmd_typ=79&cmd_mod=2&down_id=[downtime_id]&btnSubmit=Commit",
-        all_downtimes        => "[baseUrl]/extinfo.cgi?type=6",
-    },
+    ."&host=[hostname]&service=[service]"
+    ."&com_author=[user]&com_data=[comment]"
+    ."&trigger=0&start_time=[start_time]&end_time=[end_time]"
+    ."&fixed=1&btnSubmit=Commit",
+    del_host_downtime    => "[baseUrl]/cmd.cgi?cmd_typ=78&cmd_mod=2&down_id=[downtime_id]&btnSubmit=Commit",
+    del_service_downtime => "[baseUrl]/cmd.cgi?cmd_typ=79&cmd_mod=2&down_id=[downtime_id]&btnSubmit=Commit",
+    all_downtimes        => "[baseUrl]/extinfo.cgi?type=6",
+},
     multisite => {
-        host_downtime        => "[baseUrl]/view.py?output_format=json&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=hoststatus&host=[hostname]&_down_comment=[comment]&_down_from_now=yes&_down_minutes=[duration]",
-        service_downtime     => "[baseUrl]/view.py?output_format=json&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=service&host=[hostname]&service=[service]&_down_comment=[comment]&_down_from_now=yes&_down_minutes=[duration]",
-        del_host_downtime    => "[baseUrl]/view.py?output_format=json&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=api_downtimes&_remove_downtimes=Remove&downtime_id=[downtime_id]",
-        del_service_downtime => "[baseUrl]/view.py?output_format=json&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=api_downtimes&_remove_downtimes=Remove&downtime_id=[downtime_id]",
-        all_downtimes        => "[baseUrl]/view.py?output_format=json&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=api_downtimes",
+        folder_downtime        => "[baseUrl]/view.py?filled_in=actions&output_format=json&actions=yes&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=allhosts&wato_folder=[folder]&_ack_notify=on&_down_comment=[comment]&_down_from_date=[start_date]&_down_from_time=[start_time]&_down_to_date=[end_date]&_down_to_time=[end_time]&_down_minutes=[down_minutes]&_down_duration=[down_duration]&_down_custom=Custom+time+range",
+        svcregexp_downtime     => "[baseUrl]/view.py?filled_in=actions&output_format=json&actions=yes&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=allservices&service_regex=[svc_regexp]&_ack_notify=on&_down_comment=[comment]&_down_from_date=[start_date]&_down_from_time=[start_time]&_down_to_date=[end_date]&_down_to_time=[end_time]&_down_minutes=[down_minutes]&_down_duration=[down_duration]&_down_custom=Custom+time+range",
+        host_downtime          => "[baseUrl]/view.py?output_format=json&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=host&host=[hostname]&_down_comment=[comment]&_down_from_date=[start_date]&_down_from_time=[start_time]&_down_to_date=[end_date]&_down_to_time=[end_time]&_down_minutes=[down_minutes]&_down_duration=[down_duration]&_down_custom=Custom+time+range",
+        service_downtime       => "[baseUrl]/view.py?output_format=json&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=service&host=[hostname]&service=[service]&_down_comment=[comment]&_down_from_date=[start_date]&_down_from_time=[start_time]&_down_to_date=[end_date]&_down_to_time=[end_time]&_down_minutes=[down_minutes]&_down_duration=[down_duration]",
+        del_folder_downtime    => "[baseUrl]/view.py?filled_in=actions&output_format=json&actions=yes&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=allhosts&wato_folder=[folder]&_down_remove=Remove+all&_remove_downtimes=Remove&downtime_id=[downtime_id]",
+        del_host_downtime      => "[baseUrl]/view.py?output_format=json&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=api_downtimes&_remove_downtimes=Remove&downtime_id=[downtime_id]",
+        del_service_downtime   => "[baseUrl]/view.py?output_format=json&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=api_downtimes&_remove_downtimes=Remove&downtime_id=[downtime_id]",
+        del_svcregexp_downtime => "[baseUrl]/view.py?filled_in=actions&output_format=json&actions=yes&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=allservices&service_regex=[svc_regexp]&_down_remove=Remove+all&_remove_downtimes=Remove&downtime_id=[downtime_id]",
+        all_downtimes          => "[baseUrl]/view.py?output_format=json&_transid=-1&_do_confirm=yes&_do_actions=yes&&_username=[user]&_secret=[password]&view_name=api_downtimes",
     },
-);
+    );
 
 my %messages = (
     nagios => {
         success        => "Your command request was successfully submitted to Nagios for processing",
-    not_authorized => "Sorry, but you are not authorized to commit the specified command.",
-    no_author      => "Author was not entered",
+        not_authorized => "Sorry, but you are not authorized to commit the specified command.",
+        no_author      => "Author was not entered",
     },
     multisite => {
         success        => "Successfully sent 1 commands",
+        xt_success     => 'Successfully sent \d+ commands',
         not_authorized => "Invalid automation secret",
         no_author      => "TODO",
     }
 );
 
 # Load optional config file to override hardcoded defaults
-my @config_files = qw(nagios_downtime.conf /etc/nagios_downtime.conf /usr/local/etc/conf.d/nagios_downtime.conf);
-foreach my $config_file ( @config_files )
-{
-    # load the config file first found
-    if(-f $config_file) {
-        local $/=undef;
-        open IN, $config_file;
-        eval <IN>;
-        close IN;
-        last;
-    }
+my $config_file = "/usr/local/etc/conf.d/nagios_downtime.conf";
+if(-f $config_file) {
+    local $/=undef;
+    open IN, $config_file;
+    eval <IN>;
+    close IN;
 }
 
 # Load command line options to override hardcoded defaults
 Getopt::Long::Configure('bundling');
 GetOptions(
-    "h|help"        => \$help,
-    "d|debug"       => \$debug,
-    "i|interface=s" => \$type,
-    "m|mode=s"      => \$mode,
-    "H|hostname=s"  => \$hostname,
-    "S|server=s"    => \$server,
-    "p|path=s"      => \$basePath,
-    "u|user=s"      => \$user,
-    "P|password=s"  => \$userPw,
-    "t|downtime=i"  => \$downtimeDuration,
-    "c|comment=s"   => \$downtimeComment,
-    "s|service=s"   => \$service
+    "h|help"         => \$help,
+    "d|debug"        => \$debug,
+    "i|interface=s"  => \$type,
+    "m|mode=s"       => \$mode,
+    "H|hostname=s"   => \$hostname,
+    "S|server=s"     => \$server,
+    "F|watofolder=s" => \$folder,
+    "p|path=s"       => \$basePath,
+    "u|user=s"       => \$user,
+    "P|password=s"   => \$userPw,
+    "t|downtime=i"   => \$downtimeDuration,
+    "c|comment=s"    => \$downtimeComment,
+    "s|service=s"    => \$service,
+    "R|svcregexp=s"  => \$svcregexp,
+    "a|start=s"      => \$start,
+    "z|end=s"        => \$end,
+    "T|timezone=s"   => \$timezone,
 );
 
 if($help) {
@@ -263,7 +295,15 @@ if($webServer eq "") {
 
 # When a service name is set, this will be a service downtime
 if($service ne "") {
-    $downtimeType = 2;
+    $downtimeType = SERVICE_DOWNTIME;
+}
+
+if ($folder ne "") {
+    $downtimeType = FOLDER_DOWNTIME;
+}
+
+if ($svcregexp ne "") {
+    $downtimeType = SVCREGEXP_DOWNTIME;
 }
 
 # Append the script internal downtime id when id storing is enabled
@@ -274,11 +314,49 @@ if($storeDowntimeIds == 1) {
     $downtimeComment .= " (ID:".$downtimeId.")";
 }
 
-# Calculate the start of the downtime
-$start = gettime($now);
- 
-# Calculate the end of the downtime
-$end = gettime($now+$downtimeDuration*60);
+if ($downtimeDuration > 0) {
+    # Calculate the end of the downtime
+    {
+        my $from = $now;
+        $from = DateTime->new(
+            %{ parse_datetime($start) },
+            time_zone => $timezone,
+            )->set_time_zone('UTC')->epoch()
+            unless $start eq "";
+        $end   = gettime($from+$downtimeDuration*60);
+    }
+
+    # Calculate the start of the downtime
+    $start = gettime($now)
+        if $start eq "";
+} else {
+    if ($start eq "") {
+        error("Missing start date");
+    }
+    if ($end eq "") {
+        error("Missing end date");
+    }
+
+    {
+        my $dt_start = DateTime->new(
+            %{ parse_datetime($start) },
+            time_zone => $timezone,
+            )->set_time_zone('UTC');
+        my $dt_end   = DateTime->new(
+            %{ parse_datetime($end) },
+            time_zone => $timezone,
+            )->set_time_zone('UTC');
+
+        $downtimeDuration = $dt_end->delta_ms($dt_start)->in_units('minutes');
+        $duration = sprintf("%02d:%02d", int($downtimeDuration)/60, $downtimeDuration%60);
+        $downtimeDuration = 60 if $downtimeDuration > 60;
+    }
+
+    ($start_date, $start_time) = parse_datetime($start);
+    ($end_date, $end_time) = parse_datetime($end);
+}
+
+#debug("now: $now, start: $start, end: $end, duration: $downtimeDuration");
  
 # Check if web server is reachable via ping, if not, terminate the script
 $p = Net::Ping->new();
@@ -312,41 +390,84 @@ switch($mode) {
     case 'add' {
         # Add a new scheduled downtime
         # ##########################################################################
-        
-        if($downtimeType == 1) {
-            # Schedule Host Downtime
-            $url = get_url("host_downtime", {
-                baseUrl    => $baseUrl,
-                hostname   => $hostname,
-                user       => $user,
-                password   => $userPw,
-                comment    => $downtimeComment,
-                start_time => $start,
-                end_time   => $end,
-                duration   => $downtimeDuration,
-            });
-        } else {
-            # Schedule Service Downtime
-            $url = get_url("service_downtime", {
-                baseUrl    => $baseUrl,
-                hostname   => $hostname,
-                service    => $service,
-                user       => $user,
-                password   => $userPw,
-                comment    => $downtimeComment,
-                start_time => $start,
-                end_time   => $end,
-                duration   => $downtimeDuration,
-            });
-        }
-        
+
+        switch($downtimeType) {
+            case HOST_DOWNTIME {
+                # Schedule Host Downtime
+                $url = get_url("host_downtime", {
+                    baseUrl       => $baseUrl,
+                    hostname      => $hostname,
+                    user          => $user,
+                    password      => $userPw,
+                    comment       => $downtimeComment,
+                    start_date    => $start_date,
+                    start_time    => $start_time,
+                    end_date      => $end_date,
+                    end_time      => $end_time,
+                    down_minutes  => $downtimeDuration,
+                    down_duration => $duration,
+                               });
+            }
+            case SERVICE_DOWNTIME {
+                # Schedule Service Downtime
+                $url = get_url("service_downtime", {
+                    baseUrl       => $baseUrl,
+                    hostname      => $hostname,
+                    service       => $service,
+                    user          => $user,
+                    password      => $userPw,
+                    comment       => $downtimeComment,
+                    start_date    => $start_date,
+                    start_time    => $start_time,
+                    end_date      => $end_date,
+                    end_time      => $end_time,
+                    down_minutes  => $downtimeDuration,
+                    down_duration => $duration,
+                               });
+            }
+            case FOLDER_DOWNTIME {
+                # Schedule Wato-Folder-based Downtime
+                $url = get_url("folder_downtime", {
+                    baseUrl       => $baseUrl,
+                    hostname      => $hostname,
+                    folder        => $folder,
+                    user          => $user,
+                    password      => $userPw,
+                    comment       => $downtimeComment,
+                    start_date    => $start_date,
+                    start_time    => $start_time,
+                    end_date      => $end_date,
+                    end_time      => $end_time,
+                    down_minutes  => $downtimeDuration,
+                    down_duration => $duration,
+                               });
+            }
+            case SVCREGEXP_DOWNTIME {
+                # Schedule Service (regexp) Downtime
+                $url = get_url("svcregexp_downtime", {
+                    baseUrl       => $baseUrl,
+                    hostname      => $hostname,
+                    svc_regexp    => $svcregexp,
+                    user          => $user,
+                    password      => $userPw,
+                    comment       => $downtimeComment,
+                    start_date    => $start_date,
+                    start_time    => $start_time,
+                    end_date      => $end_date,
+                    end_time      => $end_time,
+                    down_minutes  => $downtimeDuration,
+                    down_duration => $duration,
+                               });
+            }
+        };
+
         debug("HTTP-GET: " . $url);
-    
+
         # Send the get request to the web server
         $oResponse = $oBrowser->get($url);
-    
+
         debug("HTTP-Response: " . $oResponse->content);
-    
+
         # Handle response code, not in detail, only first char
         switch(substr($oResponse->code,0,1)) {
             # 2xx response code is OK
@@ -354,17 +475,25 @@ switch($mode) {
                 # Do some basic handling with the response content
                 my $content = $oResponse->content;
 
+                #print $dd->dump( $content );
                 switch($content) {
                     case { index($content, get_msg("success")) != -1 } {
                         # Save the id of the just scheduled downtime
                         if($storeDowntimeIds == 1) {
                             saveDowntimeId();
                         }
-                        
+
+                        success("Downtime was submitted successfully");
+                    }
+                    case { $content =~ get_msg("xt_success" ) } {
+                        # Save the id of the just schedule downtime
+                        if ($storeDowntimeIds == 1) {
+                            saveDowntimeId();
+                        }
                         success("Downtime was submitted successfully");
                     }
                     case { index($content, get_msg("not_authorized")) != -1 } {
-                        error("Maybe not authorized or wrong hostname or servicename.");
+                        error("Maybe not authorized or wrong host- or servicename.");
                     }
                     case { index($content, get_msg("no_author")) != -1 } {
                         error("No Author entered, define Author in \$user var.");
@@ -392,14 +521,14 @@ switch($mode) {
     case 'del' {
         # Delete the last scheduled downtime
         # ##########################################################################
-        
+
         if($storeDowntimeIds != 1) {
             error("Unable to remove a downtime. The storingDowntimeIds option is set to disabled.");
         }
-        
+
         # Read all internal downtime ids for this host/service
         my @downtimes = sort({ $b <=> $a } @{getDowntimeIds()});
-        
+
         # Only proceed when downtimes found
         if (0 < scalar @downtimes) {
             # Get the nagios downtime id for the last scheduled downtime
@@ -469,21 +598,29 @@ sub success {
 
 sub delDowntimeId {
     my $internalId = shift;
-    
+
     my $file = $downtimePath.'/';
-    if($downtimeType == 1) {
-        $file .= $hostname.'.txt';
-    } else {
-        $file .= $hostname.'-'.$service.'.txt';
+    switch($downtimeType) {
+        case HOST_DOWNTIME {
+            $file .= $hostname.'.txt';
+        }
+        case SERVICE_DOWNTIME {
+            $file .= $hostname.'-'.$service.'.txt';
+        }
+        case FOLDER_DOWNTIME {
+            $file .= 'wato.'.$folder.'.txt';
+        }
+        case SVCREGEXP_DOWNTIME {
+            $file .= 'svcregexp.'.$svcregexp.'.txt';
+        }
     }
-    
+
     if(-f $file) {
         if(open(IN, "<", $file)) {
             my @contents = <IN>;
             close(IN);
-            
+
             @contents = grep { !/^$internalId$/i } @contents;
-            chomp @contents;
 
             if (0 < scalar @contents) {
                 if(open(OUT, ">", $file)) {
@@ -497,17 +634,18 @@ sub delDowntimeId {
 
 sub getDowntimeIds {
     my @arr = ();
-    
+
     my $file = $downtimePath.'/';
     if($downtimeType == 1) {
         $file .= $hostname.'.txt';
     } else {
         $file .= $hostname.'-'.$service.'.txt';
     }
-    
+
     if(-f $file) {
         if(open(DAT, "<".$file)) {
             while(my $line = <DAT>) {
+                # skip empty lines
                 next if $line =~ m/^$/;
 
                 # Do some validation
@@ -516,13 +654,13 @@ sub getDowntimeIds {
                     push(@arr, $line);
                 }
             }
-            
-            close(DAT); 
+
+            close(DAT);
         } else {
             error("Could not open temporary file (".$file.").");
         }
     }
-    
+
     return \@arr;
 }
 
@@ -536,7 +674,7 @@ sub saveDowntimeId {
 
     if(open(DAT, ">>".$file)) {
         print DAT "\n$downtimeId";
-        close(DAT); 
+        close(DAT);
     } else {
         error("Could not write downtime to temporary file (".$file.").");
     }
@@ -544,7 +682,7 @@ sub saveDowntimeId {
 
 sub getNagiosDowntimeId {
     my $internalId = shift;
-    
+
     # Get all downtimes
     my @aDowntimes = @{getAllDowntimes()};
 
@@ -554,47 +692,55 @@ sub getNagiosDowntimeId {
         #  - internal id in comment field
         #  - triggerId: N/A
         if($aDowntimes[$i]{'triggerId'} eq 'N/A' && $aDowntimes[$i]{'comment'} =~ m/\(ID:$internalId\)/) {
-            
+
             debug("Found matching downtime (Host: ".$aDowntimes[$i]{'host'}.", "
                  ."Service: ".$aDowntimes[$i]{'service'}.", Entry-Time: ".$aDowntimes[$i]{'entryTime'}.", "
                  ."Downtime-Id: ".$aDowntimes[$i]{'downtimeId'}.")");
             return $aDowntimes[$i]{'downtimeId'};
         }
     }
-    
+
     return "";
 }
 
 sub deleteDowntime {
     my $nagiosDowntimeId = shift;
+    my $downtimeURL = undef;
+    my $downtimeInfo = {
+        baseUrl     => $baseUrl,
+        user        => $user,
+        password    => $userPw,
+        downtime_id => $nagiosDowntimeId,
+    };
 
-    if($downtimeType == 1) {
-        # Host downtime
-        $url = get_url("del_host_downtime", {
-            baseUrl     => $baseUrl,
-            user        => $user,
-            password    => $userPw,
-            downtime_id => $nagiosDowntimeId,
-        });
-    } else {
-        # Service downtime
-        $url = get_url("del_service_downtime", {
-            baseUrl     => $baseUrl,
-            user        => $user,
-            password    => $userPw,
-            downtime_id => $nagiosDowntimeId,
-        });
+    switch($downtimeType) {
+        case HOST_DOWNTIME {
+            # Host downtime
+            $downtimeURL = 'del_host_downtime';
+        }
+        case SERVICE_DOWNTIME {
+            $downtimeURL = 'del_service_downtime';
+        }
+        case FOLDER_DOWNTIME {
+            $downtimeURL = 'del_folder_downtime';
+            $downtimeInfo->{folder} = $folder;
+        }
+        case SVCREGEXP_DOWNTIME {
+            $downtimeURL = 'del_svcregexp_downtime';
+            $downtimeInfo->{svc_regexp} = $svcregexp;
+        }
     }
-    
+    $url = get_url($downtimeURL, $downtimeInfo);
+
     my $oResponse;
-    
+    debug("downtimeURL: " . $downtimeURL);
     debug("HTTP-GET: " . $url);
-    
+
     # Send the get request to the web server
     $oResponse = $oBrowser->get($url);
 
     debug("HTTP-Response: " . $oResponse->content);
-    
+
     # Handle response code, not in detail, only first char
     switch(substr($oResponse->code,0,1)) {
         # 2xx response code is OK
@@ -602,6 +748,9 @@ sub deleteDowntime {
             # Do some basic handling with the response content
             switch($oResponse->content) {
                 case { index($_[0], get_msg("success")) != -1 } {
+                    print "OK: Downtime (ID: ".$nagiosDowntimeId.") has been deleted\n";
+                }
+                case { $_[0] =~ get_msg("xt_success") } {
                     print "OK: Downtime (ID: ".$nagiosDowntimeId.") has been deleted\n";
                 }
                 case { index($_[0], get_msg("not_authorized")) != -1 } {
@@ -635,7 +784,7 @@ sub getAllDowntimes {
     my @arr = ();
     my $url;
     my $oResponse;
-    
+
     # Url to downtime page
     $url = get_url("all_downtimes", {
         baseUrl    => $baseUrl,
@@ -644,7 +793,7 @@ sub getAllDowntimes {
     });
 
     debug("HTTP-GET: " . $url);
-    
+
     # Fetch information via HTTP-GET
     $oResponse = $oBrowser->get($url);
 
@@ -666,52 +815,45 @@ sub getAllDowntimes {
 
                     push @arr, { host => $1, service => '', entryTime => $2, user => $3, comment => $4, start => $5, end => $6, type => $7, duration => $8, downtimeId => $9, triggerId => $10 };
                 } elsif($line =~ m/<tr\sCLASS=\'$lineType\'><td\sCLASS=\'$lineType\'><A\sHREF=\'extinfo\.cgi\?type=1&host=([^\']+)\'>[^<]+<\/A><\/td><td\sCLASS=\'$lineType\'><A\sHREF=\'extinfo\.cgi\?type=2&host=[^\']+&service=([^\']+)\'>[^<]+<\/A><\/td><td\sCLASS=\'$lineType\'>([^<]+)<\/td><td\sCLASS=\'$lineType\'>([^<]+)<\/td><td\sCLASS=\'$lineType\'>([^<]+)<\/td><td\sCLASS=\'$lineType\'>([^<]+)<\/td><td\sCLASS=\'$lineType\'>([^<]+)<\/td><td\sCLASS=\'$lineType\'>([^<]+)<\/td><td\sCLASS=\'$lineType\'>([^<]+)<\/td><td\sCLASS=\'$lineType\'>([^<]+)<\/td><td\sCLASS=\'$lineType\'>([^<]+)<\/td>/i) {
-                    
+
                     debug("Found service downtime:\n"
                          ."Host: ".$1." Service: ".$2." EntryTime: ".$3
                          ." User: ".$4." Comment: ".$5." Start: ".$6
                          ." End: ".$7." Type: ".$8." Duration: ".$9
                          ." DowntimeID: ".$10." TriggerID: ".$11);
-                    
+
                     push @arr, { host => $1, service => $2, entryTime => $3, user => $4, comment => $5, start => $6, end => $7, type => $8, duration => $9, downtimeId => $10, triggerId => $11 };
                 }
             }
         }
     } elsif ($type eq 'multisite') {
         my @downtimes = @{decode_json($oResponse->content)};
-        my @header = @{ shift(@downtimes) }; # remove the header
 
-        # header2index map
-        my %h2i;
-        for my $idx (0 .. $#header) {
-            $h2i{ ${header[$idx]} } = $idx;
-        }
-
+        shift @downtimes; # delete header
         foreach my $row (@downtimes) {
             my @row = @{$row};
 
             push @arr, {
-                host       => $row[ $h2i{host} ],
-                service    => $row[ $h2i{service_description} ],
-                entryTime  => $row[ $h2i{downtime_entry_time} ],
-                user       => $row[ $h2i{downtime_author} ],
-                comment    => $row[ $h2i{downtime_comment} ],
-                start      => $row[ $h2i{downtime_start_time} ],
-                end        => $row[ $h2i{downtime_end_time} ],
-                type       => $row[ $h2i{downtime_fixed} ],
-                duration   => $row[ $h2i{downtime_duration} ],
-                downtimeId => $row[ $h2i{downtime_id} ],
-                origin     => $row[ $h2i{downtime_origin} || 0 ],
-                recurring  => $row[ $h2i{downtime_recurring} || 0 ],
+                host       => $row[0], #host,
+                service    => $row[1], #service_description,
+                entryTime  => $row[4], #downtime_entry_time,
+                origin     => $row[2], #downtime_origin,
+                user       => $row[3], #downtime_author,
+                comment    => $row[10], #downtime_comment,
+                start      => $row[5], #downtime_start_time,
+                end        => $row[6], #downtime_end_time,
+                type       => $row[7], #downtime_fixed,
+                duration   => $row[8], #downtime_duration,
+                recurring  => $row[9], #downtime_recurring,
+                downtimeId => $row[11], #downtime_id,
                 triggerId  => 'N/A',
             };
-
             if (scalar(@row) < 10) {
                 error("The \"downtime_id\" field is missing in the \"downtime\" view. Please add it as last field.");
             }
         }
     }
-    
+
     # return array of hashes
     return \@arr;
 }
@@ -740,9 +882,12 @@ Parameters:
  
  -H, --hostname   Name of the host the downtime should be scheduled for.
                   Important: The name must be same as in Nagios.
+ -F, --watofolder Name of the Wato Folder the downtime should be scheduled for.
+                  Important: Only valid in multisite context.
  -s, --service    Name of the service the downtime should be scheduled for.
                   Important: The name must be same as in Nagios. 
                   When empty or not set a host downtime is being submited.
+ -R, --svcregexp  Regular expression for a service the downtime should be scheduled for.
  -t, --downtime   Duration of the fixed downtime in minutes
  -c, --comment    Comment for the downtime
  
@@ -800,6 +945,24 @@ sub gettime {
             error("No valid date format given in \$nagiosDateFormat");
         }
     }
+}
+
+sub parse_datetime {
+    my ($datetime, $seconds) = @_;
+    my ($date, $time) = split /T/, $datetime;
+    my ($year, $month, $day) = split /-/, $date;
+    my ($hour, $minute, $second) = split /:/, $time;
+
+    return wantarray   ?
+        defined $seconds && $seconds == 1 ? ($date, $time) : ($date, sprintf("%02d:%02d", $hour, $minute)) :
+    {
+        year => $year,
+        month => $month,
+        day => $day,
+        hour => $hour,
+        minute => $minute,
+        second => $second,
+    };
 }
 
 # #############################################################
